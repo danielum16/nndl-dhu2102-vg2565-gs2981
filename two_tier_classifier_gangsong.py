@@ -5,10 +5,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision.transforms import transforms
-from torchvision.datasets import CIFAR10  # Replace
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.datasets import ImageFolder
-#import torchvision
 import torchvision.models as models
 from PIL import Image
 import time
@@ -97,7 +95,7 @@ class AnimalTestDataset(Dataset):
 #        if idx < 6:
 #            print(f'image after transform in test: {image}')
 #            print(f'Dimension of the image {image.size()}')
-#            check_image_values(image)
+#            check_image_values(image, idx)
 
         return image, img_name
 
@@ -140,35 +138,17 @@ class SubclassModel(nn.Module):
         return x
 
 def count_correct_predictions(outputs, labels):
-    # print('count outputs: ')
-    # print(outputs)
     softmax_outputs = nn.Softmax(dim=1)(outputs)
-    # print('count softmax outputs: ')
-    # print(softmax_outputs)
     count = 0
     _, predicted_labels = torch.max(softmax_outputs, 1)
-    # print('predicted label size: ')
-    # print(predicted_labels.size())
-    # print('label size: ')
-    # print(labels.size())
     for i in range(len(labels)):
         if labels[i] == predicted_labels[i]:
             count+=1
-#        if labels[i] == 1:
-#            print('it is category 1 which is a dog')
-#        elif labels[i] == 2:
-#            print('it is category 2 which is a reptile')
-#        if predicted_labels[i] == 1:
-#            print('Prediction is category 1 which is a dog')
-#        elif predicted_labels[i] == 2:
-#            print('Prediction is category 2 which is a reptile')
-#    print('count_correct_predictions: count:')
-#    print(count)
     return count
 
-def train_models(superclass_model, subclass_model, dataloader1, dataloader2, num_epochs_super, num_epochs_sub, use_gpu):
+def train_models(superclass_model, subclass_model, dataloader1, dataloader2, num_epochs_super, num_epochs_sub, lr_super, lr_sub, wd_super, wd_sub, use_gpu):
     print('Start training...')
-    superclass_optimizer = optim.Adam(superclass_model.parameters(), lr=0.001)
+    superclass_optimizer = optim.Adam(superclass_model.parameters(), lr=lr_super, weight_decay=wd_super)
     #if use_gpu:
     #    superclass_optimizer = superclass_optimizer.to('cuda')
     superclass_criterion = nn.CrossEntropyLoss()
@@ -213,7 +193,7 @@ def train_models(superclass_model, subclass_model, dataloader1, dataloader2, num
 
     print('superclass training done')
 
-    subclass_optimizer = optim.Adam(subclass_model.parameters(), lr=0.0001)
+    subclass_optimizer = optim.Adam(subclass_model.parameters(), lr=lr_sub, weight_decay=wd_sub)
     #if use_gpu:
     #    subclass_optimizer = subclass_optimizer.to('cuda')
     subclass_criterion = nn.CrossEntropyLoss()
@@ -231,10 +211,10 @@ def train_models(superclass_model, subclass_model, dataloader1, dataloader2, num
 #            print('superclass outputs in training subclass...')
 #            print(superclass_outputs)
             
-#            superclass_outputs_softmax = torch.softmax(superclass_outputs, dim=1)
+            superclass_outputs_softmax = torch.softmax(superclass_outputs, dim=1)
 #            print('superclass softmax outputs in training subclass...')
 #            print(superclass_outputs_softmax)
-#            _, predicted = torch.max(superclass_outputs_softmax.data, 1)
+            _, predicted = torch.max(superclass_outputs_softmax.data, 1)
 #            print('superclass max outputs in training subclass...')
 #            print(predicted)
             outputs = subclass_model(inputs, superclass_outputs)
@@ -252,54 +232,110 @@ def train_models(superclass_model, subclass_model, dataloader1, dataloader2, num
     print('training complete')
     return superclass_model, subclass_model
 
-def test(superclass_model, subclass_model, dataloader1, dataloader2, use_gpu, save_to_csv=False, return_predictions=False):
+import torch
+
+def predict_class(outputs, threshold=0.5, use_dynamic_threshold=False, mean_factor=1.0, std_factor=1.0):
+    # Apply softmax to the outputs
+    novel_idx = len(outputs[0])
+    outputs_softmax = torch.softmax(outputs, dim=1)
+    # print('outputs row length ...')
+    # print(novel_idx)
+
+    if use_dynamic_threshold:
+        print('using dynamic threshold...')
+        # Calculate the mean and standard deviation of probabilities
+        mean_prob = torch.mean(outputs_softmax)
+        std_prob = torch.std(outputs_softmax)
+        # Set the threshold based on mean and standard deviation
+        threshold = mean_factor*mean_prob.item() + std_factor*std_prob.item()
+
+    print(threshold)
+
+    # Check if none of the predicted probabilities exceed the threshold
+    max_probs, predicted_class = torch.max(outputs_softmax, dim=1)
+    print('max probs ...')
+    print(len(max_probs))
+    print(max_probs)
+
+    for i in range(len(predicted_class)):
+        max_p = max_probs[i]
+        if max_p.item() < threshold:
+            predicted_class[i] = novel_idx
+    return predicted_class
+
+
+def add_to_prediction(c0, c1, img_names, predicted):
+    test_predictions = {c0: [], c1: []}
+    if len(img_names) != len(predicted):
+        print('error, image size not equal to the number of predictions')
+        return test_predictions
+#    print('img_names size')
+#    print(len(img_names))
+    for i in range(len(img_names)):
+        img_name = img_names[i]
+#        print('img_names')
+#        print(img_name)
+        predicted_class = predicted[i]
+        test_predictions[c0].append(img_name)
+        test_predictions[c1].append(predicted_class.item())
+    return test_predictions
+
+def test(superclass_model, subclass_model, dataloader, use_gpu, save_to_csv=False, return_predictions=False):
     # Evaluate on test set, in this simple demo no special care is taken for novel/unseen classes
-    test_predictions = {'image': [], 'superclass_index': [], 'subclass_index': []}
-    dataloaders = [dataloader1, dataloader2]
+    column0 = 'ID'
+    column1 = 'Target'
+    test_predictions_super = {column0: [], column1: []}
+    test_predictions_sub = {column0: [], column1: []}
+    # index_column_names = ['superclass_index', 'subclass_index']
+    test_predictions = [test_predictions_super, test_predictions_sub]
     models = [superclass_model, subclass_model]
-    
+
     with torch.no_grad():
         superclass_out = []
-        for i in range(len(dataloaders)):
-            test_loader = dataloaders[i]
+        for i in range(len(models)):
             model = models[i]
+            current_batch = 0
             print(f'Processing class {i}')
-            for j, data in enumerate(test_loader):
-                inputs = data[0]
+            for inputs, img_names in dataloader:
                 if use_gpu:
             	    inputs = inputs.to('cuda')
-                img_name = data[1]
             
                 if i == 0:
                     outputs = model(inputs)
                     superclass_out.append(outputs)
+                    predicted = predict_class(outputs, use_dynamic_threshold=True)
                 else:
-                    outputs = model(inputs, superclass_out[j])
+                    outputs = model(inputs, superclass_out[current_batch])
+                    predicted = predict_class(outputs, use_dynamic_threshold=True, std_factor=3)
                 
 #                print('Outputs ...')
 #                print(outputs)
-                outputs_softmax = torch.softmax(outputs, dim=1)
+                # predicted = predict_class(outputs, use_dynamic_threshold=True)
+                # outputs_softmax = torch.softmax(outputs, dim=1)
 #                print('outputs softmax ...')
 #                print(outputs_softmax)
 
-                _, predicted = torch.max(outputs_softmax.data, 1)
+                # _, predicted = torch.max(outputs_softmax.data, 1)
 #                print('Test printing predicted ...')
 #                print(predicted)
 #                if predicted[0] == 1:
 #                    print('Test Prediction is category 1 which is a dog')
 #                elif predicted[0] == 2:
 #                    print('Test Prediction is category 2 which is a reptile')
+
+                # index_column_name = index_column_names[i]
+                temp_predictions = add_to_prediction(column0, column1, img_names, predicted)
+                test_predictions[i][column0].extend(temp_predictions[column0])
+                test_predictions[i][column1].extend(temp_predictions[column1])
+                current_batch+=1
             
-                if i == 0:
-                    test_predictions['image'].append(img_name[0])
-                    test_predictions['superclass_index'].append(predicted.item())
-                else:
-                    test_predictions['subclass_index'].append(predicted.item())
-            
-    test_predictions = pd.DataFrame(data=test_predictions)
+    test_predictions_super = pd.DataFrame(data=test_predictions[0])
+    test_predictions_sub = pd.DataFrame(data=test_predictions[1])
+    
         
     if save_to_csv:
-        test_predictions.to_csv('test_predictions_gs.csv', index=False)
+        test_predictions_super.to_csv('test_predictions_super.csv', index=False)
+        test_predictions_sub.to_csv('test_predictions_sub.csv', index=False)
         
     if return_predictions:
         return test_predictions
@@ -308,15 +344,19 @@ if __name__ == "__main__":
     # Define parameters
     num_superclasses = 3  # Number of superclasses (bird, dog, reptile)
     num_subclasses = 87  # Number of subclasses (87 classes)
-    num_novel = 1  # Number of novel class
+    num_novel = 0  # Number of novel class
     epochs_super = 50
-    epochs_sub = 250
+    epochs_sub = 100
     batch_size = 32
+    lr_super = 0.001
+    lr_sub = 0.0001
+    early_stop = False
+    wdecay_super = 0.0001
+    wdecay_sub = 0.001
     save_model = False
-    # root_dir =
     train_data_dir = "./Released_Data/train_shuffle"
-    train_csv_path = "./Released_Data/train_data.csv"
     test_data_dir = "./Released_Data/test_shuffle"
+    train_csv_path = "./Released_Data/train_data.csv"
     test_csv_path = "./Released_Data/test_data.csv"
     worker_count = 1
     use_gpu = False
@@ -326,18 +366,12 @@ if __name__ == "__main__":
         print("GPU is available!")
         use_gpu = True
         
-#    print(torchvision.__version__)
-
     # Create dataset, augment dataset and create dataloaders
     transform_train = transforms.Compose(
-        [transforms.Resize((64, 64)), transforms.RandomVerticalFlip(p=0.3), transforms.RandomHorizontalFlip(p=0.3), transforms.RandomRotation(15), transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2), transforms.RandomGrayscale(p=0.2), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+        [transforms.Resize((64, 64)), transforms.RandomVerticalFlip(p=0.3), transforms.RandomHorizontalFlip(p=0.3), transforms.RandomRotation(15), transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2), transforms.RandomGrayscale(p=0.2), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), transforms.RandomErasing(p=0.2)])
         
-    # transforms.RandomErasing(p=0.3), transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+    # transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
         
-    # train_dataset = CIFAR10(root='./data', train=True, download=True, transform=transform)  # Replace with actual dataset
-
-    # df = pd.read_csv(csv_path)
-
     training_dataset_superclass = AnimalDataset(train_csv_path, train_data_dir, transform=transform_train, is_super=True)
     # train_dataset = ImageFolder(root=train_data_dir, transform=transform)
     dataloader1_train = DataLoader(training_dataset_superclass, batch_size=batch_size, shuffle=True, num_workers=worker_count)
@@ -359,7 +393,7 @@ if __name__ == "__main__":
     start_time = time.time()
     # Train both models
     trained_superclass_model, trained_subclass_model = train_models(superclass_model, subclass_model, dataloader1_train,
-                                                                    dataloader2_train, epochs_super, epochs_sub, use_gpu)
+                                                                    dataloader2_train, epochs_super, epochs_sub, lr_super, lr_sub, wdecay_super, wdecay_sub,use_gpu)
     end_time = time.time()
     execution_time = end_time - start_time
     print(f"Execution time: {execution_time:.4f} seconds")
@@ -368,17 +402,16 @@ if __name__ == "__main__":
     transform_test = transforms.Compose(
         [transforms.Resize((64, 64)), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
     test_dataset = AnimalTestDataset(test_data_dir, transform=transform_test)
-    dataloader1_test = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=worker_count)
+    dataloader_test = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=worker_count)
 
-    dataloader2_test = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=worker_count) 
-
-    test(trained_superclass_model, trained_subclass_model, dataloader1_test, dataloader2_test, use_gpu, save_to_csv=True)
+    test(trained_superclass_model, trained_subclass_model, dataloader_test, use_gpu, save_to_csv=True)
 
     # Save the trained models
     if save_model:
-        super_class_model_file = f'superclass_model-{use_pretrained}.pth'
-        sub_class_model_file = f'subclass_model-{use_pretrained}.pth'
+        super_class_model_file = f'superclass_model-epoch_{epochs_super}-early_stop_{early_stop}-weight_decay_{wdecay_super}.pth'
+        sub_class_model_file = f'subclass_model-epoch_{epochs_super}_{epochs_sub}-early_stop_{early_stop}-weight_decay_{wdecay_sub}.pth'
         torch.save(trained_superclass_model.state_dict(), super_class_model_file)
         torch.save(trained_subclass_model.state_dict(), sub_class_model_file)
     
     print("Inference done.")
+    
