@@ -10,6 +10,7 @@ from torchvision.datasets import ImageFolder
 import torchvision.models as models
 from PIL import Image
 import time
+import argparse
 import pandas as pd
 
 
@@ -136,6 +137,31 @@ class SubclassModel(nn.Module):
         # return torch.softmax(self.output_layer(x), dim=1)
         # return torch.softmax(x, dim=1)
         return x
+
+def get_args():
+    parser = argparse.ArgumentParser(description="Training parameters for your model")
+    # Define arguments for each parameter
+    parser.add_argument("--num_superclasses", type=int, default=3, help="Number of superclasses")
+    parser.add_argument("--num_subclasses", type=int, default=87, help="Number of subclasses")
+    parser.add_argument("--num_novel", type=int, default=0, help="Number of novel classes")
+    parser.add_argument("--epochs_super", type=int, default=1, help="Number of epochs for superclass training")
+    parser.add_argument("--epochs_sub", type=int, default=2, help="Number of epochs for subclass training")
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument("--lr_super", type=float, default=0.001, help="Learning rate for superclass training")
+    parser.add_argument("--lr_sub", type=float, default=0.0001, help="Learning rate for subclass training")
+    parser.add_argument("--early_stop", action="store_true", default=False, help="Enable early stopping")
+    parser.add_argument("--wdecay_super", type=float, default=0.0001, help="Weight decay for superclass training")
+    parser.add_argument("--wdecay_sub", type=float, default=0.001, help="Weight decay for subclass training")
+    parser.add_argument("--save_model", action="store_true", default=True, help="Save the trained model")
+    parser.add_argument(
+    "--superclass_model_path", type=str, help="Path to the pre-trained superclass model")
+    parser.add_argument(
+    "--subclass_model_path", type=str, help="Path to the pre-trained subclass model")
+
+    # Parse the arguments and access them
+    args = parser.parse_args()
+    return args
+    
 
 def count_correct_predictions(outputs, labels):
     softmax_outputs = nn.Softmax(dim=1)(outputs)
@@ -306,7 +332,7 @@ def test(superclass_model, subclass_model, dataloader, use_gpu, save_to_csv=Fals
                     predicted = predict_class(outputs, use_dynamic_threshold=True)
                 else:
                     outputs = model(inputs, superclass_out[current_batch])
-                    predicted = predict_class(outputs, use_dynamic_threshold=True, std_factor=3)
+                    predicted = predict_class(outputs, use_dynamic_threshold=False, std_factor=3)
                 
 #                print('Outputs ...')
 #                print(outputs)
@@ -342,18 +368,23 @@ def test(superclass_model, subclass_model, dataloader, use_gpu, save_to_csv=Fals
 
 if __name__ == "__main__":
     # Define parameters
-    num_superclasses = 3  # Number of superclasses (bird, dog, reptile)
-    num_subclasses = 87  # Number of subclasses (87 classes)
-    num_novel = 0  # Number of novel class
-    epochs_super = 50
-    epochs_sub = 100
-    batch_size = 32
-    lr_super = 0.001
-    lr_sub = 0.0001
-    early_stop = False
-    wdecay_super = 0.0001
-    wdecay_sub = 0.001
-    save_model = False
+    args = get_args()
+    num_superclasses = args.num_superclasses
+    num_subclasses = args.num_subclasses
+    num_novel = args.num_novel
+    epochs_super = args.epochs_super
+    epochs_sub = args.epochs_sub
+    batch_size = args.batch_size
+    lr_super = args.lr_super
+    lr_sub = args.lr_sub
+    early_stop = args.early_stop
+    wdecay_super = args.wdecay_super
+    wdecay_sub = args.wdecay_sub
+    save_model = args.save_model
+    # Check if model paths are provided, set them as None if not
+    superclass_model_path = args.superclass_model_path if args.superclass_model_path else None
+    subclass_model_path = args.subclass_model_path if args.subclass_model_path else None
+
     train_data_dir = "./Released_Data/train_shuffle"
     test_data_dir = "./Released_Data/test_shuffle"
     train_csv_path = "./Released_Data/train_data.csv"
@@ -365,20 +396,6 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         print("GPU is available!")
         use_gpu = True
-        
-    # Create dataset, augment dataset and create dataloaders
-    transform_train = transforms.Compose(
-        [transforms.Resize((64, 64)), transforms.RandomVerticalFlip(p=0.3), transforms.RandomHorizontalFlip(p=0.3), transforms.RandomRotation(15), transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2), transforms.RandomGrayscale(p=0.2), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), transforms.RandomErasing(p=0.2)])
-        
-    # transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
-        
-    training_dataset_superclass = AnimalDataset(train_csv_path, train_data_dir, transform=transform_train, is_super=True)
-    # train_dataset = ImageFolder(root=train_data_dir, transform=transform)
-    dataloader1_train = DataLoader(training_dataset_superclass, batch_size=batch_size, shuffle=True, num_workers=worker_count)
-
-    training_dataset_subclass = AnimalDataset(train_csv_path, train_data_dir, transform=transform_train, is_super=False)
-    # train_dataset = ImageFolder(root=train_data_dir, transform=transform)
-    dataloader2_train = DataLoader(training_dataset_subclass, batch_size=2*batch_size, shuffle=True, num_workers=worker_count)
 
     # Create and initialize the superclass model
     superclass_model = SuperclassModel(num_superclasses + num_novel, use_pretrained)
@@ -390,13 +407,37 @@ if __name__ == "__main__":
     if use_gpu:
         subclass_model = subclass_model.to('cuda')
 
-    start_time = time.time()
-    # Train both models
-    trained_superclass_model, trained_subclass_model = train_models(superclass_model, subclass_model, dataloader1_train,
+    if superclass_model_path is not None and subclass_model_path is not None:
+        print('Loading pretrained models...')
+        superclass_model_state_dict = torch.load(superclass_model_path)
+        subclass_model_state_dict = torch.load(subclass_model_path)
+        superclass_model.load_state_dict(superclass_model_state_dict)
+        subclass_model.load_state_dict(subclass_model_state_dict)
+        trained_superclass_model=superclass_model
+        trained_subclass_model=subclass_model
+        save_model = False
+    else:
+        # Create dataset, augment dataset and create dataloaders
+        transform_train = transforms.Compose(
+        [transforms.Resize((64, 64)), transforms.RandomVerticalFlip(p=0.3), transforms.RandomHorizontalFlip(p=0.3), transforms.RandomRotation(15), transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2), transforms.RandomGrayscale(p=0.2), transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)), transforms.RandomErasing(p=0.2)])
+        
+        # transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 2.0)),
+        
+        training_dataset_superclass = AnimalDataset(train_csv_path, train_data_dir, transform=transform_train, is_super=True)
+        # train_dataset = ImageFolder(root=train_data_dir, transform=transform)
+        dataloader1_train = DataLoader(training_dataset_superclass, batch_size=batch_size, shuffle=True, num_workers=worker_count)
+
+        training_dataset_subclass = AnimalDataset(train_csv_path, train_data_dir, transform=transform_train, is_super=False)
+        # train_dataset = ImageFolder(root=train_data_dir, transform=transform)
+        dataloader2_train = DataLoader(training_dataset_subclass, batch_size=2*batch_size, shuffle=True, num_workers=worker_count)
+
+        start_time = time.time()
+        # Train both models
+        trained_superclass_model, trained_subclass_model = train_models(superclass_model, subclass_model, dataloader1_train,
                                                                     dataloader2_train, epochs_super, epochs_sub, lr_super, lr_sub, wdecay_super, wdecay_sub,use_gpu)
-    end_time = time.time()
-    execution_time = end_time - start_time
-    print(f"Execution time: {execution_time:.4f} seconds")
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"Execution time: {execution_time:.4f} seconds")
     
     # Inference starts (test dataset)
     transform_test = transforms.Compose(
