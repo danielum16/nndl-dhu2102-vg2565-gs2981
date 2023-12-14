@@ -336,7 +336,7 @@ def test(superclass_model, subclass_model, dataloader, use_gpu, save_to_csv=Fals
                 if i == 0:
                     outputs = model(inputs)
                     superclass_out.append(outputs)
-                    predicted = predict_class(outputs, use_dynamic_threshold=True,  std_factor=1.2)
+                    predicted = predict_class(outputs, use_dynamic_threshold=True,  std_factor=1.4)
                 else:
                     outputs = model(inputs, superclass_out[current_batch])
                     predicted = predict_class(outputs, threshold=0.9, use_dynamic_threshold=False, std_factor=3)
