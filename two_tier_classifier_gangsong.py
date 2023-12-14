@@ -7,6 +7,7 @@ import torch.optim as optim
 from torchvision.transforms import transforms
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.datasets import ImageFolder
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torchvision.models as models
 from PIL import Image
 import time
@@ -175,6 +176,7 @@ def count_correct_predictions(outputs, labels):
 def train_models(superclass_model, subclass_model, dataloader1, dataloader2, num_epochs_super, num_epochs_sub, lr_super, lr_sub, wd_super, wd_sub, use_gpu):
     print('Start training...')
     superclass_optimizer = optim.Adam(superclass_model.parameters(), lr=lr_super, weight_decay=wd_super)
+    superclass_scheduler = ReduceLROnPlateau(superclass_optimizer, patience=5)
     #if use_gpu:
     #    superclass_optimizer = superclass_optimizer.to('cuda')
     superclass_criterion = nn.CrossEntropyLoss()
@@ -215,11 +217,14 @@ def train_models(superclass_model, subclass_model, dataloader1, dataloader2, num
 
         average_loss = total_loss / len(dataloader1)
         accuracy = total_correct / total_labels
-        print(f'Epoch {epoch + 1}/{num_epochs_super}, Average Loss: {average_loss}, Accuracy: {accuracy}')
+        superclass_scheduler.step(average_loss)
+        current_lr = superclass_optimizer.param_groups[0]["lr"]
+        print(f'Epoch {epoch + 1}/{num_epochs_super}, Average Loss: {average_loss}, Accuracy: {accuracy}, Learning rate: {current_lr}')
 
     print('superclass training done')
 
     subclass_optimizer = optim.Adam(subclass_model.parameters(), lr=lr_sub, weight_decay=wd_sub)
+    subclass_scheduler = ReduceLROnPlateau(subclass_optimizer, patience=5)
     #if use_gpu:
     #    subclass_optimizer = subclass_optimizer.to('cuda')
     subclass_criterion = nn.CrossEntropyLoss()
@@ -253,7 +258,9 @@ def train_models(superclass_model, subclass_model, dataloader1, dataloader2, num
             
         average_loss = total_loss / len(dataloader2)
         accuracy = total_correct / total_labels
-        print(f'Epoch {epoch + 1}/{num_epochs_sub}, Average Loss: {average_loss}, Accuracy: {accuracy}')
+        subclass_scheduler.step(average_loss)
+        current_lr = subclass_optimizer.param_groups[0]["lr"]
+        print(f'Epoch {epoch + 1}/{num_epochs_sub}, Average Loss: {average_loss}, Accuracy: {accuracy}, Learning rate: {current_lr}')
 
     print('training complete')
     return superclass_model, subclass_model
@@ -329,10 +336,10 @@ def test(superclass_model, subclass_model, dataloader, use_gpu, save_to_csv=Fals
                 if i == 0:
                     outputs = model(inputs)
                     superclass_out.append(outputs)
-                    predicted = predict_class(outputs, use_dynamic_threshold=True)
+                    predicted = predict_class(outputs, use_dynamic_threshold=True,  std_factor=1.2)
                 else:
                     outputs = model(inputs, superclass_out[current_batch])
-                    predicted = predict_class(outputs, use_dynamic_threshold=False, std_factor=3)
+                    predicted = predict_class(outputs, threshold=0.9, use_dynamic_threshold=False, std_factor=3)
                 
 #                print('Outputs ...')
 #                print(outputs)
