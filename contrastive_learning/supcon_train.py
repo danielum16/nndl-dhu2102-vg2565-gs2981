@@ -19,7 +19,23 @@ from PIL import Image
 import pandas as pd
 import logging
 
+class nCropTransform:
+    """Create 1 or more crops of the same image"""
+    def __init__(self, transform, n_views):
+        self.n_views = n_views
+        self.transform = transform
 
+    def __call__(self, x):
+        if self.n_views == 1:
+            return self.transform(x)
+        elif self.n_views > 1:
+            return [self.transform(x) for i in range(self.n_views)]
+
+
+"""
+Implementation borrowed from https://arxiv.org/pdf/2004.11362.pdf
+Github: https://github.com/HobbitLong/SupContrast/blob/master/losses.py
+"""
 class SupConLoss(nn.Module):
     """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
     It also supports the unsupervised contrastive loss in SimCLR"""
@@ -82,6 +98,8 @@ class SupConLoss(nn.Module):
         # for numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
         logits = anchor_dot_contrast - logits_max.detach()
+        
+        logging.info(f"Sup Con logits {torch.max(logits)}, {torch.min(logits)}")
 
         # tile mask
         mask = mask.repeat(anchor_count, contrast_count)
@@ -96,10 +114,20 @@ class SupConLoss(nn.Module):
 
         # compute log_prob
         exp_logits = torch.exp(logits) * logits_mask
+        logging.info(f"Sup Con exp log {torch.max(exp_logits)}, {torch.min(exp_logits)}")
+
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+        logging.info(f"Sup Con log prob {torch.max(log_prob)}, {torch.min(log_prob)}")
+        
+        
+        logging.info(f"Sup Con mask log prob {torch.max(mask * log_prob)}, {torch.min(mask * log_prob)}")
+        logging.info(f"Sup Con mask log prob sum {torch.max((mask * log_prob).sum(1))}, {torch.min((mask * log_prob).sum(1))}")
+        logging.info(f"Mask sum {torch.max(mask.sum(1))}, {torch.min(mask.sum(1))}")
 
         # compute mean of log-likelihood over positive
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+        
+        logging.info(f"Sup Con mean log {torch.max(mean_log_prob_pos)}, {torch.min(mean_log_prob_pos)}")
 
         # loss
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
@@ -107,14 +135,12 @@ class SupConLoss(nn.Module):
 
         return loss
     
-# Create Dataset class for multilabel classification
 class MultiClassImageDataset(Dataset):
-    def __init__(self, ann_df, super_map_df, sub_map_df, img_dir, transform=None):
+    def __init__(self, ann_df, super_map_df, sub_map_df, img_dir):
         self.ann_df = ann_df
         self.super_map_df = super_map_df
         self.sub_map_df = sub_map_df
         self.img_dir = img_dir
-        self.transform = transform
 
     def __len__(self):
         return len(self.ann_df)
@@ -130,10 +156,27 @@ class MultiClassImageDataset(Dataset):
         sub_idx = self.ann_df['subclass_index'][idx]
         sub_label = self.sub_map_df['class'][sub_idx]
 
-        if self.transform:
-            image = self.transform(image)
-
         return image, super_idx, super_label, sub_idx, sub_label
+    
+class SplitMultiClassImageDataset(Dataset):
+    def __init__(self, dataset, split, transform):
+        self.dataset = dataset
+        self.split = split
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        if self.transform:
+            image, super_idx, super_label, sub_idx, sub_label = self.dataset[idx]
+            if self.split == 'train':
+                image_or_images = self.transform(image)
+            elif self.split == 'val':
+                image_or_images = self.transform(image)
+
+        return image_or_images, super_idx, super_label, sub_idx, sub_label
+    
 
 class MultiClassImageTestDataset(Dataset):
     def __init__(self, super_map_df, sub_map_df, img_dir, transform=None):
@@ -159,48 +202,59 @@ class MultiClassImageTestDataset(Dataset):
 One contrastive learning tail and one classification tail
 """
 class MultiTailModel(nn.Module):
-    def __init__(self, model_name, target='superclass', feature_dim=128, encoder_fc_dim=2048):
+    def __init__(self, model_name, target='superclass', project_out_dim=128, feature_dim=2048, multitail=True):
         super().__init__()
         if model_name == 'resnet50':
             self.encoder_network = torchvision.models.resnet50(pretrained=True)
             # Replace classification head
-            self.encoder_network.fc = nn.Linear(2048, encoder_fc_dim)
+            self.encoder_network.fc = nn.Linear(2048, feature_dim)
         elif model_name == 'inception_v3':
             self.encoder_network = torchvision.models.inception_v3(pretrained=True)
             # Replace classification head
-            self.encoder_network.fc = nn.Linear(2048, encoder_fc_dim)
-        # non-linear MLP with one hidden layer
-        # self.projection_head = nn.Sequential(
-        #     nn.Linear(encoder_fc_dim, encoder_fc_dim),
-        #     nn.ReLU(),
-        #     nn.Linear(encoder_fc_dim, feature_dim),
-        # )
-        self.projection_head = nn.Sequential(
-            nn.Linear(encoder_fc_dim, encoder_fc_dim),
-            nn.ReLU(),
-            nn.Linear(encoder_fc_dim, feature_dim),
-        )
+            self.encoder_network.fc = nn.Linear(2048, feature_dim)
+        if multitail:
+            # Got 94 percent accuracy on superclass
+            # python supcon_train.py --model_dir=.\sample --log_name=test_superclass --mode=train --model_type=resnet50 --target=superclass --multitail --print_freq_batch=20 --device=cuda --batch_size=64 --epochs=10 --optimizer=SGD --learning_rate=0.005  --momentum=0.05 --temp=0.07 --base_temp=0.07 --feature_dim=128 --encoder_fc_dim=512
+            if target == 'superclass':
+                self.projection_head = nn.Sequential(
+                    nn.Linear(feature_dim, feature_dim),
+                    nn.ReLU(),
+                    nn.Linear(feature_dim, project_out_dim),
+                )
+            elif target == "subclass":
+                self.projection_head = nn.Sequential(
+                    nn.Linear(feature_dim, feature_dim),
+                    nn.ReLU(),
+                    nn.Linear(feature_dim, project_out_dim),
+                )
+        else:
+            self.projection_head = None
+        
         if target == 'superclass':
-            self.fc = nn.Linear(encoder_fc_dim, 4)
+            self.fc = nn.Linear(feature_dim, 4)
         elif target == 'subclass':
-            self.fc = nn.Linear(encoder_fc_dim, 88)
+            self.fc = nn.Linear(feature_dim, 88)
         else:
             raise ValueError('target must be superclass or subclass')
             
     
     def forward(self, x):
+        # Classification tail
         encoder_output = self.encoder_network(x)
         encoder_output = F.normalize(encoder_output, p=2, dim=1)
-        z = self.projection_head(encoder_output)
-        z_normalized = F.normalize(z, p=2, dim=1)
         class_logits = self.fc(encoder_output)
-        return z_normalized, class_logits
+        # Contrastive tail
+        if self.projection_head:
+            z = self.projection_head(encoder_output)
+            z_normalized = F.normalize(z, p=2, dim=1)
+            return z_normalized, class_logits
+        return None, class_logits
             
 class Trainer():
     def __init__(self, opt, model_1, model_2, criterion, optimizer, train_loader, val_loader, test_loader=None, device='cpu'):
         self.opt = opt
         self.model_1 = model_1.to(device)
-        self.model_2 = model_2
+        self.model_2 = model_2 # Used for generating test predictions for subclass task
         self.contrast_criterion = criterion
         self.classification_criterion = nn.CrossEntropyLoss()
         self.optimizer = optimizer
@@ -215,22 +269,39 @@ class Trainer():
         running_contrastive_loss = 0.0
         running_classification_loss = 0.0
         for i, data in enumerate(self.train_loader):
-            inputs, super_labels, sub_labels = data[0].to(self.device), data[1].to(self.device), data[3].to(self.device)
+            # inputs, super_labels, sub_labels = data[0].to(self.device), data[1].to(self.device), data[3].to(self.device)
+            inputs, super_labels, sub_labels = data[0], data[1].to(self.device), data[3].to(self.device)
+            logging.info(len(inputs))
             labels = super_labels if self.opt.target == 'superclass' else sub_labels
             self.optimizer.zero_grad()
+            
+            if isinstance(inputs, list):# If training with 2 > views
+                inputs = torch.cat(inputs, dim=0).to(self.device)
+                logging.info(inputs.size())
+                
             feature_vect, class_logits = self.model_1(inputs)
-            logging.info(feature_vect)
-            logging.info(class_logits)
             # logging.info(f"TRAIN {feature_vect.size()}, {class_logits.size()}, {labels.size()}")
-            contrastive_loss = self.contrast_criterion(feature_vect, labels)
-            classification_loss = self.classification_criterion(class_logits, labels)
-            loss = contrastive_loss + classification_loss
+            if opt.multitail:
+                # Trying to get the contrastive output feature vect into [batch_size, num_views, feature_dim]
+                # for arbitrary number of views
+                feature_vect = torch.split(feature_vect, [opt.batch_size, opt.batch_size], dim=0)
+                feature_vect = torch.cat([feature.unsqueeze(1) for feature in feature_vect], dim=1)
+                contrastive_loss = self.contrast_criterion(feature_vect, labels)
+                labels = labels.repeat(opt.views)
+                classification_loss = self.classification_criterion(class_logits, labels)
+                loss = contrastive_loss + classification_loss
+            else:
+                if opt.views > 1:
+                    logging.error("Single tail training with multiple views")
+                    sys.exit(1)
+                classification_loss = self.classification_criterion(class_logits, labels)
+                loss = classification_loss
             loss.backward()
             self.optimizer.step()
             if i % self.opt.print_freq_batch == 0:
-                logging.info(f"Batch: {i}, Total Loss = {loss.item()} Contrastive Loss: {contrastive_loss.item()}, Classification Loss: {classification_loss.item()}")
+                logging.info(f"Batch: {i}, Total Loss = {loss.item()} Contrastive Loss: {contrastive_loss.item() if opt.multitail else None}, Classification Loss: {classification_loss.item()}")
             running_loss += loss.item()
-            running_contrastive_loss += contrastive_loss.item()
+            running_contrastive_loss += contrastive_loss.item() if opt.multitail else 0.0
             running_classification_loss += classification_loss.item()
 
         logging.info(f'Training loss: {running_loss/i:.3f}')
@@ -245,17 +316,20 @@ class Trainer():
         running_loss = 0.0
         running_contrastive_loss = 0.0
         running_classification_loss = 0.0
-        self.model1.eval()
+        self.model_1.eval()
         with torch.no_grad():
             for i, data in enumerate(self.val_loader):
                 inputs, super_labels, sub_labels = data[0].to(self.device), data[1].to(self.device), data[3].to(self.device)
                 labels = super_labels if self.opt.target == 'superclass' else sub_labels
                 feature_vect, class_logits = self.model_1(inputs)
-                # loss = self.criterion(super_outputs, super_labels) + self.criterion(sub_outputs, sub_labels)
-                # loss = self.criterion(super_outputs, super_labels)
-                contrastive_loss = self.contrast_criterion(feature_vect, labels)
-                classification_loss = self.classification_criterion(class_logits, labels)
-                loss = contrastive_loss + classification_loss
+    
+                if opt.multitail:
+                    contrastive_loss = self.contrast_criterion(feature_vect, labels)
+                    classification_loss = self.classification_criterion(class_logits, labels)
+                    loss = contrastive_loss + classification_loss
+                else:
+                    classification_loss = self.classification_criterion(class_logits, labels)
+                    loss = classification_loss
                 _, predicted = torch.max(class_logits.data, 1)
 
                 total += labels.size(0)
@@ -263,7 +337,7 @@ class Trainer():
                 correct += (predicted == labels).sum().item()
                 # sub_correct += (sub_predicted == sub_labels).sum().item()
                 running_loss += loss.item()
-                running_contrastive_loss += contrastive_loss.item()
+                running_contrastive_loss += contrastive_loss.item() if opt.multitail else 0.0
                 running_classification_loss += classification_loss.item()
 
         logging.info(f'Validation loss: {running_loss/i:.3f}')
@@ -314,6 +388,10 @@ def parse_option():
                         help='which encoder model?')
     parser.add_argument('--target', type=str, default="superclass",
                         help='Superclass or subclass?')
+    parser.add_argument('--multitail', action="store_true",
+                        help='Train contrastive and classification tails together?')
+    parser.add_argument('--views', type=int, default=0,
+                        help='How many data augmentations per image?')
     
     parser.add_argument('--print_freq_batch', type=int, default=1,
                         help='print frequency')
@@ -350,10 +428,10 @@ def parse_option():
                         help='temperature for contrastive loss function')
     parser.add_argument('--base_temp', type=float, default=0.07,
                         help='temperature for loss function')
-    parser.add_argument('--feature_dim', type=int, default=128,
-                        help='temperature for loss function')
-    parser.add_argument('--encoder_fc_dim', type=int, default=2048,
-                        help='temperature for loss function')
+    parser.add_argument('--feature_dim', type=int, default=2048,
+                        help='feature dim')
+    parser.add_argument('--project_out_dim', type=int, default=128,
+                        help='projection network output dimension')
 
     # other setting
     # parser.add_argument('--cosine', action='store_true',
@@ -366,6 +444,13 @@ def parse_option():
 
     # Make the directory for saving model(s) for the experiment
     os.makedirs(opt.model_dir, exist_ok=True)
+    
+    if opt.multitail and opt.views <= 1:
+        logging.error("Multitail training requires at least 2 views")
+        parse_status = False
+    # if not opt.multitail and opt.views > 1:
+    #     logging.error("Can only have 1 view single tail training")
+    #     parse_status = False
         
     # iterations = opt.lr_decay_epochs.split(',')
     # opt.lr_decay_epochs = list([])
@@ -409,7 +494,7 @@ def parse_option():
 if __name__ == "__main__":
     opt, parse_status = parse_option()
     if parse_status == False:
-        print("Argument parsing failed")
+        logging.error("Argument parsing failed")
         sys.exit(1)
         
     stream_handler = logging.StreamHandler(sys.stdout)
@@ -417,9 +502,7 @@ if __name__ == "__main__":
         
     logging.basicConfig(
         level=logging.DEBUG,
-        # filename=os.path.join(opt.model_dir, opt.log_name),
         format="%(asctime)s [%(levelname)s] %(message)s",
-        # filemode="a",
         handlers=[logging.FileHandler(os.path.join(opt.model_dir, opt.log_name), mode='w'),
                               stream_handler]
     )
@@ -434,13 +517,58 @@ if __name__ == "__main__":
     train_img_dir = os.path.join(opt.dataset_dir, "train_shuffle")
     test_img_dir = os.path.join(opt.dataset_dir, "test_shuffle")
 
-    image_preprocessing = transforms.Compose([
+    
+    # image_preprocessing = transforms.Compose([
+    #     transforms.ToTensor(),
+    #     transforms.Normalize(mean=(0), std=(1)),
+    # ])
+    
+    transform = None
+    if opt.multitail:
+        logging.info(f"Multi-tail training with {opt.views} views per image")
+        image_preprocessing =  transforms.Compose([
+            transforms.RandomResizedCrop(32, scale=(0.2, 1.)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([
+                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+            ], p=0.8),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0), std=(1)),
+        ])
+        train_transform = nCropTransform(image_preprocessing, opt.views)
+        logging.info("Created nCropTransform")
+    else:
+        if opt.views < 1:
+            logging.info(f"Single tail training with {opt.views} views per image")
+            image_preprocessing =  transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0), std=(1)),
+            ])
+            train_transform = image_preprocessing
+        else:
+            logging.info(f"Single tail training with {opt.views} view per image")
+            image_preprocessing =  transforms.Compose([
+                transforms.RandomResizedCrop(size=opt.size, scale=(0.2, 1.)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomApply([
+                    transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+                ], p=0.8),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0), std=(1)),
+            ])
+            train_transform = nCropTransform(image_preprocessing, opt.views)
+        
+    validation_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=(0), std=(1)),
     ])
-
     # Create train and val split
-    train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir, transform=image_preprocessing)
+    # train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir, transform=image_preprocessing)
+    
+    # train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir, transform=train_transform)
+    train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir)
 
     proportions = [.8, .2]
     lengths = [int(p * len(train_dataset)) for p in proportions]
@@ -448,10 +576,21 @@ if __name__ == "__main__":
     #train_dataset, val_dataset = random_split(train_dataset, [0.9, 0.1])
     # Since I'm using PyTorch 1.1.0, I can't use the above line of code
     train_dataset, val_dataset = random_split(train_dataset, lengths)
+    # Adding in validation split's transformation
+    # val_dataset.dataset.transform = validation_transform
+    train_dataset = SplitMultiClassImageDataset(train_dataset, 'train', transform=train_transform)
+    val_dataset = SplitMultiClassImageDataset(val_dataset, 'val', transform=validation_transform)
+    
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0), std=(1)),
+    ])
     # Create test dataset
-    test_dataset = MultiClassImageTestDataset(super_map_df, sub_map_df, test_img_dir, transform=image_preprocessing)
+    test_dataset = MultiClassImageTestDataset(super_map_df, sub_map_df, test_img_dir, transform=test_transform)
     
     # Create data loaders
+    logging.info("Creating DataLoaders")
+    logging.info(f"Batch size: {opt.batch_size}, Effective Batch size: {opt.batch_size * opt.views if opt.views > 0 else 1}")
     train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
@@ -459,7 +598,7 @@ if __name__ == "__main__":
     # Create model
     model = MultiTailModel(opt.model_type, target=opt.target, 
                            feature_dim=opt.feature_dim, 
-                           encoder_fc_dim=opt.encoder_fc_dim).to(opt.device)
+                           project_out_dim=opt.project_out_dim, multitail=opt.multitail).to(opt.device)
 
     # Create criterion
     criterion = SupConLoss(temperature=opt.temp, base_temperature=opt.base_temp)
