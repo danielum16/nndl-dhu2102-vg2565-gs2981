@@ -19,6 +19,8 @@ from PIL import Image
 import pandas as pd
 import logging
 
+MY_PATH = r".\sample\sample2"
+
 class nCropTransform:
     """Create 1 or more crops of the same image"""
     def __init__(self, transform, n_views):
@@ -98,8 +100,6 @@ class SupConLoss(nn.Module):
         # for numerical stability
         logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
         logits = anchor_dot_contrast - logits_max.detach()
-        
-        logging.info(f"Sup Con logits {torch.max(logits)}, {torch.min(logits)}")
 
         # tile mask
         mask = mask.repeat(anchor_count, contrast_count)
@@ -114,21 +114,9 @@ class SupConLoss(nn.Module):
 
         # compute log_prob
         exp_logits = torch.exp(logits) * logits_mask
-        logging.info(f"Sup Con exp log {torch.max(exp_logits)}, {torch.min(exp_logits)}")
-
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
-        logging.info(f"Sup Con log prob {torch.max(log_prob)}, {torch.min(log_prob)}")
-        
-        
-        logging.info(f"Sup Con mask log prob {torch.max(mask * log_prob)}, {torch.min(mask * log_prob)}")
-        logging.info(f"Sup Con mask log prob sum {torch.max((mask * log_prob).sum(1))}, {torch.min((mask * log_prob).sum(1))}")
-        logging.info(f"Mask sum {torch.max(mask.sum(1))}, {torch.min(mask.sum(1))}")
-
         # compute mean of log-likelihood over positive
         mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
-        
-        logging.info(f"Sup Con mean log {torch.max(mean_log_prob_pos)}, {torch.min(mean_log_prob_pos)}")
-
         # loss
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
         loss = loss.view(anchor_count, batch_size).mean()
@@ -204,14 +192,18 @@ One contrastive learning tail and one classification tail
 class MultiTailModel(nn.Module):
     def __init__(self, model_name, target='superclass', project_out_dim=128, feature_dim=2048, multitail=True):
         super().__init__()
+        self.model_name = model_name
         if model_name == 'resnet50':
             self.encoder_network = torchvision.models.resnet50(pretrained=True)
             # Replace classification head
             self.encoder_network.fc = nn.Linear(2048, feature_dim)
-        elif model_name == 'inception_v3':
-            self.encoder_network = torchvision.models.inception_v3(pretrained=True)
-            # Replace classification head
-            self.encoder_network.fc = nn.Linear(2048, feature_dim)
+        # elif model_name == 'inception_v3':
+        #     self.upsample = nn.Upsample(size=75, mode='bilinear')
+        #     self.encoder_network = torchvision.models.inception_v3(pretrained=True)
+        #     self.encoder_network.AuxLogits = None
+        #     logging.info(self.encoder_network)
+        #     # Replace classification head
+        #     self.encoder_network.fc = nn.Linear(2048, feature_dim)
         if multitail:
             # Got 94 percent accuracy on superclass
             # python supcon_train.py --model_dir=.\sample --log_name=test_superclass --mode=train --model_type=resnet50 --target=superclass --multitail --print_freq_batch=20 --device=cuda --batch_size=64 --epochs=10 --optimizer=SGD --learning_rate=0.005  --momentum=0.05 --temp=0.07 --base_temp=0.07 --feature_dim=128 --encoder_fc_dim=512
@@ -239,7 +231,10 @@ class MultiTailModel(nn.Module):
             
     
     def forward(self, x):
+        # logging.info(x.size())
         # Classification tail
+        # if self.model_name == "inception_v3":
+        #     x = self.upsample(x)
         encoder_output = self.encoder_network(x)
         encoder_output = F.normalize(encoder_output, p=2, dim=1)
         class_logits = self.fc(encoder_output)
@@ -251,10 +246,9 @@ class MultiTailModel(nn.Module):
         return None, class_logits
             
 class Trainer():
-    def __init__(self, opt, model_1, model_2, criterion, optimizer, train_loader, val_loader, test_loader=None, device='cpu'):
+    def __init__(self, opt, model, criterion, optimizer, train_loader, val_loader, test_loader=None, device='cpu'):
         self.opt = opt
-        self.model_1 = model_1.to(device)
-        self.model_2 = model_2 # Used for generating test predictions for subclass task
+        self.model = model.to(device)
         self.contrast_criterion = criterion
         self.classification_criterion = nn.CrossEntropyLoss()
         self.optimizer = optimizer
@@ -264,27 +258,29 @@ class Trainer():
         self.device = device
 
     def train_epoch(self):
-        self.model_1.train()
+        self.model.train()
         running_loss = 0.0
         running_contrastive_loss = 0.0
         running_classification_loss = 0.0
         for i, data in enumerate(self.train_loader):
             # inputs, super_labels, sub_labels = data[0].to(self.device), data[1].to(self.device), data[3].to(self.device)
             inputs, super_labels, sub_labels = data[0], data[1].to(self.device), data[3].to(self.device)
-            logging.info(len(inputs))
+            
             labels = super_labels if self.opt.target == 'superclass' else sub_labels
             self.optimizer.zero_grad()
             
             if isinstance(inputs, list):# If training with 2 > views
                 inputs = torch.cat(inputs, dim=0).to(self.device)
-                logging.info(inputs.size())
+            else:
+                inputs = inputs.to(self.device)
                 
-            feature_vect, class_logits = self.model_1(inputs)
+            feature_vect, class_logits = self.model(inputs)
             # logging.info(f"TRAIN {feature_vect.size()}, {class_logits.size()}, {labels.size()}")
+                        
             if opt.multitail:
                 # Trying to get the contrastive output feature vect into [batch_size, num_views, feature_dim]
                 # for arbitrary number of views
-                feature_vect = torch.split(feature_vect, [opt.batch_size, opt.batch_size], dim=0)
+                feature_vect = torch.split(feature_vect, [opt.batch_size for i in range(opt.views)], dim=0)
                 feature_vect = torch.cat([feature.unsqueeze(1) for feature in feature_vect], dim=1)
                 contrastive_loss = self.contrast_criterion(feature_vect, labels)
                 labels = labels.repeat(opt.views)
@@ -292,9 +288,10 @@ class Trainer():
                 loss = contrastive_loss + classification_loss
             else:
                 if opt.views > 1:
-                    logging.error("Single tail training with multiple views")
-                    sys.exit(1)
-                classification_loss = self.classification_criterion(class_logits, labels)
+                    labels = labels.repeat(opt.views)
+                    classification_loss = self.classification_criterion(class_logits, labels)
+                else:
+                    classification_loss = self.classification_criterion(class_logits, labels)
                 loss = classification_loss
             loss.backward()
             self.optimizer.step()
@@ -316,12 +313,12 @@ class Trainer():
         running_loss = 0.0
         running_contrastive_loss = 0.0
         running_classification_loss = 0.0
-        self.model_1.eval()
+        self.model.eval()
         with torch.no_grad():
             for i, data in enumerate(self.val_loader):
                 inputs, super_labels, sub_labels = data[0].to(self.device), data[1].to(self.device), data[3].to(self.device)
                 labels = super_labels if self.opt.target == 'superclass' else sub_labels
-                feature_vect, class_logits = self.model_1(inputs)
+                feature_vect, class_logits = self.model(inputs)
     
                 if opt.multitail:
                     contrastive_loss = self.contrast_criterion(feature_vect, labels)
@@ -345,32 +342,32 @@ class Trainer():
         logging.info(f'Validation classification loss: {running_classification_loss/i:.3f}')
         logging.info(f'Validation {self.opt.target} acc: {100 * correct / total:.2f} %')
 
-    def test(self, save_to_csv=False, return_predictions=False, model1=None, model2=None):
-        if not self.test_loader:
-            raise NotImplementedError('test_loader not specified')
+def test(test_loader, model1, model2, device, save_to_csv=False, return_predictions=False):
+    if not test_loader:
+        raise NotImplementedError('test_loader not specified')
 
-        # Evaluate on test set, in this simple demo no special care is taken for novel/unseen classes
-        test_predictions = {'image': [], 'superclass_index': [], 'subclass_index': []}
-        with torch.no_grad():
-            for i, data in enumerate(self.test_loader):
-                inputs, img_name = data[0].to(self.device), data[1]
+    # Evaluate on test set, in this simple demo no special care is taken for novel/unseen classes
+    test_predictions = {'image': [], 'superclass_index': [], 'subclass_index': []}
+    with torch.no_grad():
+        for i, data in enumerate(test_loader):
+            inputs, img_name = data[0].to(device), data[1]
 
-                super_outputs, sub_outputs = self.model(inputs)
-                
-                _, super_predicted = torch.max(super_outputs.data, 1)
-                _, sub_predicted = torch.max(sub_outputs.data, 1)
+            super_outputs, sub_outputs = model(inputs)
+            
+            _, super_predicted = torch.max(super_outputs.data, 1)
+            _, sub_predicted = torch.max(sub_outputs.data, 1)
 
-                test_predictions['image'].append(img_name[0])
-                test_predictions['superclass_index'].append(super_predicted.item())
-                test_predictions['subclass_index'].append(sub_predicted.item())
+            test_predictions['image'].append(img_name[0])
+            test_predictions['superclass_index'].append(super_predicted.item())
+            test_predictions['subclass_index'].append(sub_predicted.item())
 
-        test_predictions = pd.DataFrame(data=test_predictions)
+    test_predictions = pd.DataFrame(data=test_predictions)
 
-        if save_to_csv:
-            test_predictions.to_csv('example_test_predictions.csv', index=False)
+    if save_to_csv:
+        test_predictions.to_csv('example_test_predictions.csv', index=False)
 
-        if return_predictions:
-            return test_predictions
+    if return_predictions:
+        return test_predictions
 
 
 def parse_option():
@@ -378,8 +375,8 @@ def parse_option():
     
     parser.add_argument('--dataset_dir', type=str, default='../Released_Data',
                         help='dataset dir containing train_data.csv, test_data.csv, superclass_mapping.csv, subclass_mapping.csv')
-    parser.add_argument('--model_dir', type=str,
-                        help='where to save models from training or which model to specifically load')
+    # parser.add_argument('--model_dir', type=str,
+    #                     help='where to save models from training or which model to specifically load')
     parser.add_argument('--log_name', type=str,
                         help='name of the log file')
     parser.add_argument('--mode', type=str, default="train",
@@ -392,6 +389,10 @@ def parse_option():
                         help='Train contrastive and classification tails together?')
     parser.add_argument('--views', type=int, default=0,
                         help='How many data augmentations per image?')
+    parser.add_argument('--model1_path', type=str, default="",
+                        help='Path for superclass model. Only used when mode==test')
+    parser.add_argument('--model2_path', type=str, default="",
+                        help='Path for subclass model. Only used when mode==test')
     
     parser.add_argument('--print_freq_batch', type=int, default=1,
                         help='print frequency')
@@ -443,10 +444,16 @@ def parse_option():
     parse_status = True
 
     # Make the directory for saving model(s) for the experiment
-    os.makedirs(opt.model_dir, exist_ok=True)
+    if opt.mode == "train":
+        # os.makedirs(opt.model_dir, exist_ok=True)
+        os.makedirs(MY_PATH, exist_ok=True)
     
-    if opt.multitail and opt.views <= 1:
+    if opt.mode == "train" and opt.multitail and opt.views <= 1:
         logging.error("Multitail training requires at least 2 views")
+        parse_status = False
+    
+    if opt.mode == "test" and (opt.model1_path == "" or opt.model2_path == ""):
+        logging.error("Test mode requires model1_path and model2_path")
         parse_status = False
     # if not opt.multitail and opt.views > 1:
     #     logging.error("Can only have 1 view single tail training")
@@ -492,143 +499,162 @@ def parse_option():
 
 
 if __name__ == "__main__":
-    opt, parse_status = parse_option()
-    if parse_status == False:
-        logging.error("Argument parsing failed")
-        sys.exit(1)
-        
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.DEBUG)
-        
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(os.path.join(opt.model_dir, opt.log_name), mode='w'),
-                              stream_handler]
-    )
-    
-    logging.info("Starting Training")
-    logging.info(opt)
-    # Create the datasets and dataloaders
-    train_ann_df = pd.read_csv(os.path.join(opt.dataset_dir, "train_data.csv"))
-    super_map_df = pd.read_csv(os.path.join(opt.dataset_dir, "superclass_mapping.csv"))
-    sub_map_df = pd.read_csv(os.path.join(opt.dataset_dir, "subclass_mapping.csv"))
+    try:
+        opt, parse_status = parse_option()
+        if parse_status == False:
+            logging.error("Argument parsing failed")
+            sys.exit(1)
+            
+            
+        if opt.mode == "train":
+            stream_handler = logging.StreamHandler(sys.stdout)
+            stream_handler.setLevel(logging.DEBUG)
+            
+            model_config = f'model-{opt.target}-model_type_{opt.model_type}-multitail_{opt.multitail}-views_{opt.views}-epoch_{opt.epochs}-batch_size-{opt.batch_size}-optim_{opt.optimizer}-lr_{opt.learning_rate}-weight_decay_{opt.weight_decay}-mom_{opt.momentum}-{opt.device}'
+                
+            logging.basicConfig(
+                level=logging.DEBUG,
+                format="%(asctime)s [%(levelname)s] %(message)s",
+                handlers=[logging.FileHandler(os.path.join(MY_PATH, model_config + ".log"), mode='w'),
+                                    stream_handler]
+            )
+            
+            logging.info("Starting Training")
+            logging.info(opt)
+            # Create the datasets and dataloaders
+            train_ann_df = pd.read_csv(os.path.join(opt.dataset_dir, "train_data.csv"))
+            super_map_df = pd.read_csv(os.path.join(opt.dataset_dir, "superclass_mapping.csv"))
+            sub_map_df = pd.read_csv(os.path.join(opt.dataset_dir, "subclass_mapping.csv"))
 
-    train_img_dir = os.path.join(opt.dataset_dir, "train_shuffle")
-    test_img_dir = os.path.join(opt.dataset_dir, "test_shuffle")
+            train_img_dir = os.path.join(opt.dataset_dir, "train_shuffle")
+            test_img_dir = os.path.join(opt.dataset_dir, "test_shuffle")
 
-    
-    # image_preprocessing = transforms.Compose([
-    #     transforms.ToTensor(),
-    #     transforms.Normalize(mean=(0), std=(1)),
-    # ])
-    
-    transform = None
-    if opt.multitail:
-        logging.info(f"Multi-tail training with {opt.views} views per image")
-        image_preprocessing =  transforms.Compose([
-            transforms.RandomResizedCrop(32, scale=(0.2, 1.)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomApply([
-                transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-            ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0), std=(1)),
-        ])
-        train_transform = nCropTransform(image_preprocessing, opt.views)
-        logging.info("Created nCropTransform")
-    else:
-        if opt.views < 1:
-            logging.info(f"Single tail training with {opt.views} views per image")
-            image_preprocessing =  transforms.Compose([
+            
+            # image_preprocessing = transforms.Compose([
+            #     transforms.ToTensor(),
+            #     transforms.Normalize(mean=(0), std=(1)),
+            # ])
+            
+            transform = None
+            if opt.multitail:
+                logging.info(f"Multi-tail training with {opt.views} views per image")
+                image_preprocessing =  transforms.Compose([
+                    transforms.RandomResizedCrop(32, scale=(0.2, 1.)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomApply([
+                        transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+                    ], p=0.8),
+                    transforms.RandomGrayscale(p=0.2),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=(0), std=(1)),
+                ])
+                train_transform = nCropTransform(image_preprocessing, opt.views)
+            else:
+                if opt.views < 1:
+                    logging.info(f"Single tail training with {opt.views} views per image")
+                    image_preprocessing =  transforms.Compose([
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=(0), std=(1)),
+                    ])
+                    train_transform = image_preprocessing
+                else:
+                    logging.info(f"Single tail training with {opt.views} view per image")
+                    image_preprocessing =  transforms.Compose([
+                        transforms.RandomResizedCrop(size=32, scale=(0.2, 1.)),
+                        transforms.RandomHorizontalFlip(),
+                        transforms.RandomApply([
+                            transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+                        ], p=0.8),
+                        transforms.RandomGrayscale(p=0.2),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=(0), std=(1)),
+                    ])
+                    train_transform = nCropTransform(image_preprocessing, opt.views)
+                
+            validation_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize(mean=(0), std=(1)),
             ])
-            train_transform = image_preprocessing
-        else:
-            logging.info(f"Single tail training with {opt.views} view per image")
-            image_preprocessing =  transforms.Compose([
-                transforms.RandomResizedCrop(size=opt.size, scale=(0.2, 1.)),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomApply([
-                    transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-                ], p=0.8),
-                transforms.RandomGrayscale(p=0.2),
+            # Create train and val split
+            # train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir, transform=image_preprocessing)
+            
+            # train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir, transform=train_transform)
+            train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir)
+
+            proportions = [.8, .2]
+            lengths = [int(p * len(train_dataset)) for p in proportions]
+            lengths[-1] = len(train_dataset) - sum(lengths[:-1])
+            #train_dataset, val_dataset = random_split(train_dataset, [0.9, 0.1])
+            # Since I'm using PyTorch 1.1.0, I can't use the above line of code
+            train_dataset, val_dataset = random_split(train_dataset, lengths)
+            # Adding in validation split's transformation
+            # val_dataset.dataset.transform = validation_transform
+            train_dataset = SplitMultiClassImageDataset(train_dataset, 'train', transform=train_transform)
+            val_dataset = SplitMultiClassImageDataset(val_dataset, 'val', transform=validation_transform)
+            
+            # Create data loaders
+            logging.info("Creating DataLoaders")
+            logging.info(f"Batch size: {opt.batch_size}, Effective Batch size: {opt.batch_size * opt.views if opt.views > 0 else 1}")
+            train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=opt.num_workers)
+            val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers)
+
+            # Create model
+            model = MultiTailModel(opt.model_type, target=opt.target, 
+                                feature_dim=opt.feature_dim, 
+                                project_out_dim=opt.project_out_dim, multitail=opt.multitail).to(opt.device)
+            
+            model_file = os.path.join(opt.model_dir, model_config + "_" + ".pth")
+            logging.info(f"Saving model to {model_file}")
+            torch.save(model.state_dict(), model_file)
+            sys.exit()
+            # Create criterion
+            if opt.multitail:
+                criterion = SupConLoss(temperature=opt.temp, base_temperature=opt.base_temp)
+            else:
+                criterion = None
+
+            # Create optimizer
+            if opt.optimizer == 'SGD':
+                optimizer = optim.SGD(model.parameters(), lr=opt.learning_rate, 
+                                    momentum=opt.momentum, weight_decay=opt.weight_decay)
+            elif opt.optimizer == 'Adam':
+                optimizer = optim.Adam(model.parameters(), lr=opt.learning_rate,
+                                        weight_decay=opt.weight_decay)
+
+            # Create trainer
+            trainer = Trainer(opt, model, criterion, optimizer, train_loader, val_loader, device=opt.device)
+
+            # Train
+            for epoch in range(opt.epochs):
+                logging.info(f'Epoch: {epoch}')
+                trainer.train_epoch()
+                trainer.validate_epoch()
+            logging.info("Finished Training. Saving model...")
+            
+            model_file = os.path.join(opt.model_dir, model_config + "_" + ".pth")
+            logging.info(f"Saving model to {model_file}")
+            torch.save(model.state_dict(), model_file)
+
+        
+        if opt.mode == "test":
+            test_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize(mean=(0), std=(1)),
             ])
-            train_transform = nCropTransform(image_preprocessing, opt.views)
-        
-    validation_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0), std=(1)),
-    ])
-    # Create train and val split
-    # train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir, transform=image_preprocessing)
-    
-    # train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir, transform=train_transform)
-    train_dataset = MultiClassImageDataset(train_ann_df, super_map_df, sub_map_df, train_img_dir)
-
-    proportions = [.8, .2]
-    lengths = [int(p * len(train_dataset)) for p in proportions]
-    lengths[-1] = len(train_dataset) - sum(lengths[:-1])
-    #train_dataset, val_dataset = random_split(train_dataset, [0.9, 0.1])
-    # Since I'm using PyTorch 1.1.0, I can't use the above line of code
-    train_dataset, val_dataset = random_split(train_dataset, lengths)
-    # Adding in validation split's transformation
-    # val_dataset.dataset.transform = validation_transform
-    train_dataset = SplitMultiClassImageDataset(train_dataset, 'train', transform=train_transform)
-    val_dataset = SplitMultiClassImageDataset(val_dataset, 'val', transform=validation_transform)
-    
-    test_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0), std=(1)),
-    ])
-    # Create test dataset
-    test_dataset = MultiClassImageTestDataset(super_map_df, sub_map_df, test_img_dir, transform=test_transform)
-    
-    # Create data loaders
-    logging.info("Creating DataLoaders")
-    logging.info(f"Batch size: {opt.batch_size}, Effective Batch size: {opt.batch_size * opt.views if opt.views > 0 else 1}")
-    train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
-
-    # Create model
-    model = MultiTailModel(opt.model_type, target=opt.target, 
-                           feature_dim=opt.feature_dim, 
-                           project_out_dim=opt.project_out_dim, multitail=opt.multitail).to(opt.device)
-
-    # Create criterion
-    criterion = SupConLoss(temperature=opt.temp, base_temperature=opt.base_temp)
-
-    # Create optimizer
-    if opt.optimizer == 'SGD':
-        optimizer = optim.SGD(model.parameters(), lr=opt.learning_rate, 
-                              momentum=opt.momentum, weight_decay=opt.weight_decay)
-    elif opt.optimizer == 'Adam':
-        optimizer = optim.Adam(model.parameters(), lr=opt.learning_rate,
-                                weight_decay=opt.weight_decay)
-
-    # Create trainer
-    trainer = Trainer(opt, model, None, criterion, optimizer, train_loader, val_loader, test_loader, device=opt.device)
-
-    # Train
-    for epoch in range(opt.epochs):
-        logging.info(f'Epoch: {epoch}')
-        trainer.train_epoch()
-        trainer.validate_epoch()
-    logging.info("Finished Training. Saving model...")
-    
-    # f"{opt.target}_{opt.model_type}_epoch={epochs_super}_bz{batch_size}-early_stop_{early_stop}-weight_decay_{wdecay_super}.pth}"
-    
-    # super_class_model_file = f'{}_model-epoch_{epochs_super}-early_stop_{early_stop}-weight_decay_{wdecay_super}.pth'
-    # sub_class_model_file = f'subclass_model-epoch_{epochs_super}_{epochs_sub}-early_stop_{early_stop}-weight_decay_{wdecay_sub}.pth'
-    # torch.save(trained_superclass_model.state_dict(), super_class_model_file)
-    # torch.save(trained_subclass_model.state_dict(), sub_class_model_file)
-    
-
-    # # Test
-    # test_predictions = trainer.test(save_to_csv=True, return_predictions=True)
-    # print(test_predictions.head())
+            # Create test dataset
+            test_dataset = MultiClassImageTestDataset(super_map_df, sub_map_df, test_img_dir, transform=test_transform)
+            test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+            
+            model1 = MultiTailModel("superclass", target=opt.target,
+                                feature_dim=opt.feature_dim, 
+                                project_out_dim=opt.project_out_dim, multitail=opt.multitail).to(opt.device)
+            model2 = MultiTailModel("subclass", target=opt.target,
+                                feature_dim=opt.feature_dim, 
+                                project_out_dim=opt.project_out_dim, multitail=opt.multitail).to(opt.device)
+            
+            # # Test
+            # test_predictions = trainer.test(save_to_csv=True, return_predictions=True)
+            # print(test_predictions.head())
+    except Exception as e:
+        logging.error(e, exc_info=True)
+        raise
