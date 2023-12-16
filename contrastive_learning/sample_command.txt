@@ -1,0 +1,6 @@
+# Example of training a multitail subclass model
+python supcon_train.py --model_dir=./sample/sample_experiment --mode=train --model_type=resnet50 --target=subclass --print_freq_batch=1 --device=cuda --batch_size=128 --epochs=1 --optimizer=SGD --learning_rate=0.5 --momentum=0.9 --temp=0.07 --base_temp=0.07 --feature_dim=128 --project_out_dim=2048 --views=2
+
+
+# Example of generating superclass and subclass predictions
+python supcon_train.py  --mode=test --model_type=resnet50 --device=cuda  --feature_dim=128 --project_out_dim=2048 --model1_path=./sample/sample_experiment/model-superclass-model_type_resnet50-multitail_True-views_2-epoch_1-batch_size-128-optim_SGD-lr_0.5-weight_decay_0-mom_0.9-cuda_.pth --model2_path=./sample/sample_experiment/model-subclass-model_type_resnet50-multitail_True-views_2-epoch_1-batch_size-128-optim_SGD-lr_0.5-weight_decay_0-mom_0.9-cuda_.pth --multitail

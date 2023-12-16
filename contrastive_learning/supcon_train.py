@@ -19,7 +19,7 @@ from PIL import Image
 import pandas as pd
 import logging
 
-MY_PATH = r".\sample\sample2"
+MY_PATH = "./sample/sample2"
 
 class nCropTransform:
     """Create 1 or more crops of the same image"""
@@ -342,7 +342,7 @@ class Trainer():
         logging.info(f'Validation classification loss: {running_classification_loss/i:.3f}')
         logging.info(f'Validation {self.opt.target} acc: {100 * correct / total:.2f} %')
 
-def test(test_loader, model1, model2, device, save_to_csv=False, return_predictions=False):
+def test(test_loader, model1, model2, device, save_to_csv="", return_predictions=False):
     if not test_loader:
         raise NotImplementedError('test_loader not specified')
 
@@ -352,7 +352,9 @@ def test(test_loader, model1, model2, device, save_to_csv=False, return_predicti
         for i, data in enumerate(test_loader):
             inputs, img_name = data[0].to(device), data[1]
 
-            super_outputs, sub_outputs = model(inputs)
+            # super_outputs, sub_outputs = model(inputs)
+            _, super_outputs = model1(inputs)
+            _, sub_outputs = model2(inputs)
             
             _, super_predicted = torch.max(super_outputs.data, 1)
             _, sub_predicted = torch.max(sub_outputs.data, 1)
@@ -360,11 +362,12 @@ def test(test_loader, model1, model2, device, save_to_csv=False, return_predicti
             test_predictions['image'].append(img_name[0])
             test_predictions['superclass_index'].append(super_predicted.item())
             test_predictions['subclass_index'].append(sub_predicted.item())
+            print(f"Processed image {i}")
 
     test_predictions = pd.DataFrame(data=test_predictions)
 
     if save_to_csv:
-        test_predictions.to_csv('example_test_predictions.csv', index=False)
+        test_predictions.to_csv(save_to_csv, index=False)
 
     if return_predictions:
         return test_predictions
@@ -373,12 +376,15 @@ def test(test_loader, model1, model2, device, save_to_csv=False, return_predicti
 def parse_option():
     parser = argparse.ArgumentParser('argument for training')
     
+    # Training parameters
     parser.add_argument('--dataset_dir', type=str, default='../Released_Data',
                         help='dataset dir containing train_data.csv, test_data.csv, superclass_mapping.csv, subclass_mapping.csv')
-    # parser.add_argument('--model_dir', type=str,
-    #                     help='where to save models from training or which model to specifically load')
+    parser.add_argument('--model_dir', type=str,
+                        help='where to save models from training or which model to specifically load')
     parser.add_argument('--log_name', type=str,
                         help='name of the log file')
+    
+    # Training and Testing
     parser.add_argument('--mode', type=str, default="train",
                         help='train, valid, or test?')
     parser.add_argument('--model_type', type=str, default="resnet50",
@@ -389,14 +395,21 @@ def parse_option():
                         help='Train contrastive and classification tails together?')
     parser.add_argument('--views', type=int, default=0,
                         help='How many data augmentations per image?')
+    
+    # Testing
     parser.add_argument('--model1_path', type=str, default="",
                         help='Path for superclass model. Only used when mode==test')
     parser.add_argument('--model2_path', type=str, default="",
                         help='Path for subclass model. Only used when mode==test')
+    parser.add_argument('--csv_path', type=str, default="./example_test_predictions.csv",
+                        help='Path for storing the csv file of predictions Only used when mode==test')
     
+    # Training
     parser.add_argument('--print_freq_batch', type=int, default=1,
                         help='print frequency')
-    parser.add_argument('--device', type=str, default="cpu",
+    
+    # Training
+    parser.add_argument('--device', type=str, default="cuda",
                         help='Cuda or CPU?')
     # parser.add_argument('--save_freq', type=int, default=50,
     #                     help='save frequency')
@@ -407,7 +420,7 @@ def parse_option():
     parser.add_argument('--epochs', type=int, default=10,
                         help='number of training epochs')
 
-    # optimization
+    # Training: optimization
     parser.add_argument('--optimizer', type=str, default='SGD')
     parser.add_argument('--learning_rate', type=float, default=0.5,
                         help='learning rate')
@@ -424,7 +437,7 @@ def parse_option():
     # parser.add_argument('--method', type=str, default='SupCon',
     #                     choices=['SupCon', 'SimCLR'], help='choose method')
 
-    # temperature
+    # Training: temperature
     parser.add_argument('--temp', type=float, default=0.07,
                         help='temperature for contrastive loss function')
     parser.add_argument('--base_temp', type=float, default=0.07,
@@ -445,8 +458,8 @@ def parse_option():
 
     # Make the directory for saving model(s) for the experiment
     if opt.mode == "train":
-        # os.makedirs(opt.model_dir, exist_ok=True)
-        os.makedirs(MY_PATH, exist_ok=True)
+        os.makedirs(opt.model_dir, exist_ok=True)
+        # os.makedirs(MY_PATH, exist_ok=True)
     
     if opt.mode == "train" and opt.multitail and opt.views <= 1:
         logging.error("Multitail training requires at least 2 views")
@@ -515,8 +528,10 @@ if __name__ == "__main__":
             logging.basicConfig(
                 level=logging.DEBUG,
                 format="%(asctime)s [%(levelname)s] %(message)s",
-                handlers=[logging.FileHandler(os.path.join(MY_PATH, model_config + ".log"), mode='w'),
+                handlers=[logging.FileHandler(os.path.join(opt.model_dir, model_config + ".log"), mode='w'),
                                     stream_handler]
+                # handlers=[logging.FileHandler(os.path.join(MY_PATH, model_config + ".log"), mode='w'),
+                #                     stream_handler]
             )
             
             logging.info("Starting Training")
@@ -602,11 +617,14 @@ if __name__ == "__main__":
             model = MultiTailModel(opt.model_type, target=opt.target, 
                                 feature_dim=opt.feature_dim, 
                                 project_out_dim=opt.project_out_dim, multitail=opt.multitail).to(opt.device)
+            logging.info(model)
             
-            model_file = os.path.join(opt.model_dir, model_config + "_" + ".pth")
-            logging.info(f"Saving model to {model_file}")
-            torch.save(model.state_dict(), model_file)
-            sys.exit()
+            # model_file = os.path.join(opt.model_dir, model_config + "_" + ".pth")
+            # # model_file = os.path.join(MY_PATH, model_config + "_" + ".pth")
+            # logging.info(f"Saving model to {model_file}")
+            # torch.save(model.state_dict(), model_file)
+            # sys.exit()
+            
             # Create criterion
             if opt.multitail:
                 criterion = SupConLoss(temperature=opt.temp, base_temperature=opt.base_temp)
@@ -636,25 +654,35 @@ if __name__ == "__main__":
             torch.save(model.state_dict(), model_file)
 
         
-        if opt.mode == "test":
+        elif opt.mode == "test":
             test_transform = transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize(mean=(0), std=(1)),
             ])
+            
+            super_map_df = pd.read_csv(os.path.join(opt.dataset_dir, "superclass_mapping.csv"))
+            sub_map_df = pd.read_csv(os.path.join(opt.dataset_dir, "subclass_mapping.csv"))
+
+            test_img_dir = os.path.join(opt.dataset_dir, "test_shuffle")
+            
             # Create test dataset
             test_dataset = MultiClassImageTestDataset(super_map_df, sub_map_df, test_img_dir, transform=test_transform)
             test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
             
-            model1 = MultiTailModel("superclass", target=opt.target,
-                                feature_dim=opt.feature_dim, 
+            model1 = MultiTailModel(opt.model_type, "superclass",
+                                feature_dim=opt.feature_dim,
                                 project_out_dim=opt.project_out_dim, multitail=opt.multitail).to(opt.device)
-            model2 = MultiTailModel("subclass", target=opt.target,
+            model2 = MultiTailModel(opt.model_type, "subclass",
                                 feature_dim=opt.feature_dim, 
                                 project_out_dim=opt.project_out_dim, multitail=opt.multitail).to(opt.device)
             
-            # # Test
-            # test_predictions = trainer.test(save_to_csv=True, return_predictions=True)
-            # print(test_predictions.head())
+            model1.load_state_dict(torch.load(opt.model1_path))
+            model2.load_state_dict(torch.load(opt.model2_path))
+            model1.eval()
+            model2.eval()
+            
+            test(test_loader, model1, model2, opt.device, save_to_csv="example_test_predictions.csv", return_predictions=False)
+            
     except Exception as e:
         logging.error(e, exc_info=True)
         raise
