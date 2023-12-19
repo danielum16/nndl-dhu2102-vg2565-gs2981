@@ -12,7 +12,10 @@ def main(args):
 
     unseen_label = 3
     if is_subclass:
+        print('The current data is subclass data, setting unseen to 87')
         unseen_label = 87
+    else:
+        print('The current data is superclass data, setting unseen to 3')
 
     for file_path in args.csv_files:
         # Read CSV file
@@ -57,7 +60,7 @@ if __name__ == "__main__":
 
     ensemble_data_dir = "ensemble_test_data/"
     parser.add_argument("csv_files", nargs="*", default=[ensemble_data_dir + "test_predictions_sub1.csv", ensemble_data_dir + "test_predictions_sub2.csv", ensemble_data_dir + "test_predictions_sub3.csv"], help="List of CSV file paths")
-    parser.add_argument("--is_subclass", action="store_true", default=True,
+    parser.add_argument("--is_subclass", action="store_true", default=False,
                         help="Flag indicating whether the files represent subclass predictions")
 
     # Parse the command-line arguments
